@@ -1,3 +1,35 @@
+import io
+import json
+import os
+
+import altair as alt
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+import tensorflow as tf
+
+FS = 100
+WINDOW_SIZE = 100
+STRIDE = 10
+THRESHOLD = 0.5
+MEAN_DETECTION_LATENCY = 0.3409
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+REFERENCE_FILENAME = "reference_earthquake_109C.csv"
+REFERENCE_ID = "109C.TA_20070904204109_EV"
+REFERENCE_MAGNITUDE = 2.27
+REFERENCE_P_TIME = 9.00
+
+st.set_page_config(page_title="Earthquake Early Warning", page_icon="🌍", layout="wide")
+
+@st.cache_resource
+def load_models():
+    cnn = tf.keras.models.load_model(os.path.join(MODEL_DIR, "pwave_cnn_v2.keras"))
+    magnitude = joblib.load(os.path.join(MODEL_DIR, "magnitude_random_forest.pkl"))
+    mean = np.load(os.path.join(MODEL_DIR, "channel_mean.npy"))
+    std = np.load(os.path.join(MODEL_DIR, "channel_std.npy"))
     with open(os.path.join(BASE_DIR, "feature_columns.json"), encoding="utf-8") as f:
         columns = json.load(f)
     return cnn, magnitude, mean, std, columns
@@ -62,99 +94,3 @@ def load_waveform(uploaded_file):
     if trace.ndim != 2 or trace.shape[1] != 3:
         raise ValueError("Waveform must contain exactly three numeric columns in E, N, Z order.")
     if len(trace) < 2 * WINDOW_SIZE:
-        raise ValueError("Waveform must contain at least two seconds of data.")
-    if not np.isfinite(trace).all():
-        raise ValueError("Waveform contains NaN or infinite values.")
-    return trace
-
-
-def detect_p_wave(trace, cnn, channel_mean, channel_std):
-    starts = np.arange(0, len(trace) - WINDOW_SIZE + 1, STRIDE)
-    windows = np.stack([trace[s:s + WINDOW_SIZE] for s in starts]).astype(np.float32)
-    normalized = (windows - channel_mean) / (channel_std + 1e-8)
-    probabilities = cnn.predict(normalized, batch_size=256, verbose=0).ravel()
-    triggered = np.flatnonzero(probabilities >= THRESHOLD)
-    if not len(triggered):
-        return None, probabilities, starts
-    index = int(triggered[0])
-    decision_time = (starts[index] + WINDOW_SIZE) / FS
-    estimated_p_time = decision_time - MEAN_DETECTION_LATENCY
-    return {
-        "probability": float(probabilities[index]),
-        "decision_time": float(decision_time),
-        "estimated_p_time": float(estimated_p_time),
-        "p_sample": int(round(estimated_p_time * FS)),
-    }, probabilities, starts
-
-
-def arrival_rules(is_reference, result):
-    rules = []
-    if is_reference:
-        rules.append((REFERENCE_P_TIME, "Actual P-wave", "#16a34a"))
-    if result is not None:
-        rules.append((result["estimated_p_time"], "Estimated P-wave", "#dc2626"))
-    return rules
-
-
-def add_arrival_rules(chart, rules):
-    for arrival_time, label, color in rules:
-        marker = alt.Chart(pd.DataFrame({"Time": [arrival_time]})).mark_rule(
-            color=color, strokeDash=[6, 4], strokeWidth=2.5
-        ).encode(x="Time:Q", tooltip=[alt.Tooltip("Time:Q", format=".2f", title=label)])
-        chart = chart + marker
-    return chart
-
-
-def show_waveform_charts(trace, result, probabilities, starts, is_reference):
-    st.subheader("Seismic Waveform Analysis")
-    st.caption("Green dashed line: actual labelled P-wave. Red dashed line: estimated P-wave.")
-    time = np.arange(len(trace)) / FS
-    rules = arrival_rules(is_reference, result)
-
-    for channel, label in enumerate(["East (E)", "North (N)", "Vertical (Z)"]):
-        data = pd.DataFrame({"Time": time, "Amplitude": trace[:, channel]})
-        line = alt.Chart(data).mark_line(strokeWidth=1).encode(
-            x=alt.X("Time:Q", title="Time (seconds)", scale=alt.Scale(domain=[0, float(time[-1])])),
-            y=alt.Y("Amplitude:Q", title="Amplitude"),
-            tooltip=[alt.Tooltip("Time:Q", format=".2f"), alt.Tooltip("Amplitude:Q", format=".3f")],
-        ).properties(title=label, height=180)
-        st.altair_chart(add_arrival_rules(line, rules), use_container_width=True)
-
-    decision_times = (np.asarray(starts) + WINDOW_SIZE) / FS
-    probability_data = pd.DataFrame({"Time": decision_times, "Probability": probabilities})
-    prob_line = alt.Chart(probability_data).mark_line(color="#7c3aed").encode(
-        x=alt.X("Time:Q", title="Decision time (seconds)"),
-        y=alt.Y("Probability:Q", title="CNN probability", scale=alt.Scale(domain=[0, 1])),
-        tooltip=[alt.Tooltip("Time:Q", format=".2f"), alt.Tooltip("Probability:Q", format=".4f")],
-    ).properties(title="CNN P-wave Detection Probability", height=220)
-    threshold_rule = alt.Chart(pd.DataFrame({"Threshold": [THRESHOLD]})).mark_rule(
-        color="#6b7280", strokeDash=[3, 3]
-    ).encode(y="Threshold:Q")
-    st.altair_chart(add_arrival_rules(prob_line + threshold_rule, rules), use_container_width=True)
-    st.caption(f"Detection probability threshold: {THRESHOLD:.2f}")
-
-
-st.title("🌍 Earthquake Early Warning System")
-st.subheader("P-wave Detection and Magnitude Estimation")
-st.caption("Machine Learning Research Prototype | 100 Hz | Three-component seismic waveform")
-st.info("Upload a CSV or NPY waveform with three components in East (E), North (N), Vertical (Z) order.")
-
-uploaded_file = st.file_uploader("Upload seismic waveform", type=["csv", "npy"])
-
-if uploaded_file is not None and st.button("Analyze Earthquake", type="primary"):
-    try:
-        with st.spinner("Loading models and analyzing waveform..."):
-            cnn, magnitude_model, channel_mean, channel_std, columns = load_models()
-            trace = load_waveform(uploaded_file)
-            result, probabilities, starts = detect_p_wave(trace, cnn, channel_mean, channel_std)
-
-        st.success("Waveform loaded successfully.")
-        is_reference = uploaded_file.name == REFERENCE_FILENAME
-        if is_reference:
-            st.info(f"Reference case selected: {REFERENCE_ID}")
-            st.caption("Reference matching is based on filename only. It does not authenticate file contents.")
-
-        show_waveform_charts(trace, result, probabilities, starts, is_reference)
-
-        if result is None:
-            st.warning("No P-wave trigger detected at the selected threshold.")
