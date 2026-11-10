@@ -6,4 +6,4 @@ pandas
 matplotlib
 scikit-learn
 joblib
-
+altair
