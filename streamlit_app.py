@@ -383,15 +383,15 @@ if uploaded_file is not None:
 
             st.write("### Seismic Waveform Graph")
 
-st.pyplot(
-    fig,
-    clear_figure=True,
-    use_container_width=True
-)
+            st.pyplot(
+                fig,
+                clear_figure=True,
+                use_container_width=True
+             )
 
-plt.close(fig)
+             plt.close(fig)
 
-st.success("Waveform graph rendered.")
+             st.success("Waveform graph rendered.")
 
             # ---------------- P-WAVE DETECTION ----------------
 
