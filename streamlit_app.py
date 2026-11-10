@@ -2,6 +2,7 @@
 import os
 import io
 import json
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,18 +10,23 @@ import tensorflow as tf
 import joblib
 import matplotlib.pyplot as plt
 
-# ---------------- CONFIGURATION ----------------
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
 FS = 100
 WINDOW_SIZE = 100
 STRIDE = 10
 THRESHOLD = 0.5
+
+# Approximate average detection latency from the research experiment
 MEAN_DETECTION_LATENCY = 0.3409
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
-# Verified STEAD reference recording
+# STEAD reference recording
 REFERENCE_FILENAME = "reference_earthquake_109C.csv"
 REFERENCE_ID = "109C.TA_20070904204109_EV"
 REFERENCE_MAGNITUDE = 2.27
@@ -32,30 +38,51 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------- LOAD MODELS ----------------
+
+# ============================================================
+# 2. LOAD TRAINED MODELS
+# ============================================================
 
 @st.cache_resource
 def load_models():
+
     cnn = tf.keras.models.load_model(
         os.path.join(MODEL_DIR, "pwave_cnn_v2.keras")
     )
 
-    magnitude = joblib.load(
+    magnitude_model = joblib.load(
         os.path.join(MODEL_DIR, "magnitude_random_forest.pkl")
     )
 
-    mean = np.load(os.path.join(MODEL_DIR, "channel_mean.npy"))
-    std = np.load(os.path.join(MODEL_DIR, "channel_std.npy"))
+    channel_mean = np.load(
+        os.path.join(MODEL_DIR, "channel_mean.npy")
+    )
 
-    with open(os.path.join(BASE_DIR, "feature_columns.json")) as f:
-        columns = json.load(f)
+    channel_std = np.load(
+        os.path.join(MODEL_DIR, "channel_std.npy")
+    )
 
-    return cnn, magnitude, mean, std, columns
+    with open(
+        os.path.join(BASE_DIR, "feature_columns.json"),
+        "r"
+    ) as f:
+        feature_columns = json.load(f)
+
+    return (
+        cnn,
+        magnitude_model,
+        channel_mean,
+        channel_std,
+        feature_columns
+    )
 
 
-# ---------------- FEATURE EXTRACTION ----------------
+# ============================================================
+# 3. SIGNAL FEATURE EXTRACTION
+# ============================================================
 
 def extract_signal_features(signal, prefix):
+
     signal = np.asarray(signal, dtype=np.float64)
     signal = np.nan_to_num(signal)
 
@@ -64,19 +91,34 @@ def extract_signal_features(signal, prefix):
     energy = np.sum(signal ** 2)
 
     spectrum = np.abs(np.fft.rfft(signal))
-    frequencies = np.fft.rfftfreq(len(signal), d=1 / FS)
+
+    frequencies = np.fft.rfftfreq(
+        len(signal),
+        d=1 / FS
+    )
 
     total_power = np.sum(spectrum ** 2) + 1e-12
 
-    dominant_frequency = frequencies[np.argmax(spectrum)]
+    dominant_frequency = frequencies[
+        np.argmax(spectrum)
+    ]
 
-    centroid = np.sum(frequencies * spectrum) / (
-        np.sum(spectrum) + 1e-12
+    centroid = (
+        np.sum(frequencies * spectrum) /
+        (np.sum(spectrum) + 1e-12)
     )
 
     def band_ratio(low, high):
-        mask = (frequencies >= low) & (frequencies < high)
-        return np.sum(spectrum[mask] ** 2) / total_power
+
+        mask = (
+            (frequencies >= low) &
+            (frequencies < high)
+        )
+
+        return (
+            np.sum(spectrum[mask] ** 2) /
+            total_power
+        )
 
     return {
         f"{prefix}_rms": rms,
@@ -93,79 +135,145 @@ def extract_signal_features(signal, prefix):
     }
 
 
-def extract_magnitude_features(trace, p_sample, feature_columns):
-    p_window = trace[p_sample:p_sample + WINDOW_SIZE]
-    noise_window = trace[p_sample - WINDOW_SIZE:p_sample]
+# ============================================================
+# 4. MAGNITUDE FEATURE EXTRACTION
+# ============================================================
 
-    if len(p_window) != WINDOW_SIZE or len(noise_window) != WINDOW_SIZE:
+def extract_magnitude_features(
+    trace,
+    p_sample,
+    feature_columns
+):
+
+    p_start = int(p_sample)
+    p_end = p_start + WINDOW_SIZE
+
+    noise_start = p_start - WINDOW_SIZE
+    noise_end = p_start
+
+    if noise_start < 0 or p_end > len(trace):
         raise ValueError(
-            "Not enough samples around the estimated P-wave arrival."
+            "Not enough waveform samples around the estimated "
+            "P-wave arrival to calculate magnitude features."
         )
+
+    p_window = trace[p_start:p_end]
+    noise_window = trace[noise_start:noise_end]
 
     features = {}
 
     for channel, name in enumerate(["E", "N", "Z"]):
+
         features.update(
-            extract_signal_features(p_window[:, channel], name)
+            extract_signal_features(
+                p_window[:, channel],
+                name
+            )
         )
 
-        p_rms = np.sqrt(np.mean(p_window[:, channel] ** 2))
-        noise_rms = np.sqrt(np.mean(noise_window[:, channel] ** 2))
+        p_rms = np.sqrt(
+            np.mean(p_window[:, channel] ** 2)
+        )
 
-        features[f"{name}_snr"] = p_rms / (noise_rms + 1e-12)
+        noise_rms = np.sqrt(
+            np.mean(noise_window[:, channel] ** 2)
+        )
 
-    combined = np.sqrt(np.sum(p_window ** 2, axis=1))
+        features[f"{name}_snr"] = (
+            p_rms / (noise_rms + 1e-12)
+        )
 
-    features.update(
-        extract_signal_features(combined, "combined")
+    combined = np.sqrt(
+        np.sum(p_window ** 2, axis=1)
     )
 
-    return pd.DataFrame([features])[feature_columns]
+    features.update(
+        extract_signal_features(
+            combined,
+            "combined"
+        )
+    )
+
+    feature_df = pd.DataFrame([features])
+
+    return feature_df[feature_columns]
 
 
-# ---------------- LOAD WAVEFORM ----------------
+# ============================================================
+# 5. LOAD WAVEFORM
+# ============================================================
 
 def load_waveform(uploaded_file):
+
     extension = uploaded_file.name.lower().split(".")[-1]
 
     if extension == "npy":
+
         trace = np.load(
             io.BytesIO(uploaded_file.getvalue()),
             allow_pickle=False
         )
 
     elif extension == "csv":
-        df = pd.read_csv(io.BytesIO(uploaded_file.getvalue()))
-        trace = df.select_dtypes(include=[np.number]).to_numpy()
+
+        dataframe = pd.read_csv(
+            io.BytesIO(uploaded_file.getvalue())
+        )
+
+        trace = dataframe.select_dtypes(
+            include=[np.number]
+        ).to_numpy()
 
     else:
-        raise ValueError("Upload a CSV or NPY file.")
 
-    trace = np.asarray(trace, dtype=np.float32)
+        raise ValueError(
+            "Please upload a CSV or NPY waveform."
+        )
+
+    trace = np.asarray(
+        trace,
+        dtype=np.float32
+    )
 
     if trace.ndim != 2 or trace.shape[1] != 3:
+
         raise ValueError(
             "Waveform must contain exactly three numeric columns: E, N, Z."
         )
 
     if len(trace) < 2 * WINDOW_SIZE:
-        raise ValueError("Waveform must contain at least two seconds of data.")
+
+        raise ValueError(
+            "Waveform must contain at least two seconds of data."
+        )
 
     return np.nan_to_num(trace)
 
 
-# ---------------- P-WAVE DETECTION ----------------
+# ============================================================
+# 6. CNN P-WAVE DETECTION
+# ============================================================
 
-def detect_p_wave(trace, cnn, channel_mean, channel_std):
+def detect_p_wave(
+    trace,
+    cnn,
+    channel_mean,
+    channel_std
+):
 
-    starts = list(range(
-        0,
-        len(trace) - WINDOW_SIZE + 1,
-        STRIDE
-    ))
+    starts = list(
+        range(
+            0,
+            len(trace) - WINDOW_SIZE + 1,
+            STRIDE
+        )
+    )
 
     windows = np.asarray(
-        [trace[s:s + WINDOW_SIZE] for s in starts],
+        [
+            trace[start:start + WINDOW_SIZE]
+            for start in starts
+        ],
         dtype=np.float32
     )
 
@@ -179,62 +287,97 @@ def detect_p_wave(trace, cnn, channel_mean, channel_std):
         verbose=0
     ).flatten()
 
-    triggered = np.where(probabilities >= THRESHOLD)[0]
+    triggered = np.where(
+        probabilities >= THRESHOLD
+    )[0]
 
     if len(triggered) == 0:
+
         return None, probabilities, starts
 
-    idx = int(triggered[0])
+    index = int(triggered[0])
 
-    decision_time = (starts[idx] + WINDOW_SIZE) / FS
+    decision_time = (
+        starts[index] + WINDOW_SIZE
+    ) / FS
 
     estimated_p_time = (
         decision_time - MEAN_DETECTION_LATENCY
     )
 
-    p_sample = int(round(estimated_p_time * FS))
+    p_sample = int(
+        round(estimated_p_time * FS)
+    )
 
-    return {
-        "probability": float(probabilities[idx]),
-        "decision_time": decision_time,
-        "estimated_p_time": estimated_p_time,
+    result = {
+        "probability": float(probabilities[index]),
+        "decision_time": float(decision_time),
+        "estimated_p_time": float(estimated_p_time),
         "p_sample": p_sample
-    }, probabilities, starts
+    }
+
+    return result, probabilities, starts
 
 
-# ---------------- DASHBOARD ----------------
+# ============================================================
+# 7. DASHBOARD HEADER
+# ============================================================
 
 st.title("🌍 Earthquake Early Warning System")
 
-st.subheader("P-wave Detection and Magnitude Estimation")
+st.subheader(
+    "P-wave Detection and Magnitude Estimation"
+)
 
 st.caption(
-    "Machine Learning Research Prototype | 100 Hz | "
-    "Three-component seismic waveform"
+    "Machine Learning Research Prototype | "
+    "100 Hz | Three-component seismic waveform"
 )
 
 st.info(
-    "Upload a seismic waveform containing three numeric components "
-    "in this order: East (E), North (N), Vertical (Z)."
+    "Upload a seismic waveform containing three numeric "
+    "components in this order: East (E), North (N), Vertical (Z)."
 )
+
+
+# ============================================================
+# 8. FILE UPLOAD
+# ============================================================
 
 uploaded_file = st.file_uploader(
     "Upload seismic waveform",
     type=["csv", "npy"]
 )
 
+
+# ============================================================
+# 9. ANALYZE WAVEFORM
+# ============================================================
+
 if uploaded_file is not None:
 
-    if st.button("Analyze Earthquake", type="primary"):
+    if st.button(
+        "Analyze Earthquake",
+        type="primary"
+    ):
 
         try:
-            with st.spinner("Analyzing seismic waveform..."):
 
-                cnn, magnitude_model, channel_mean, channel_std, columns = (
-                    load_models()
+            with st.spinner(
+                "Loading models and analyzing waveform..."
+            ):
+
+                (
+                    cnn,
+                    magnitude_model,
+                    channel_mean,
+                    channel_std,
+                    feature_columns
+                ) = load_models()
+
+                trace = load_waveform(
+                    uploaded_file
                 )
-
-                trace = load_waveform(uploaded_file)
 
                 result, probabilities, starts = detect_p_wave(
                     trace,
@@ -243,19 +386,24 @@ if uploaded_file is not None:
                     channel_std
                 )
 
-            st.success("Waveform loaded successfully!")
+            st.success(
+                "Waveform loaded successfully!"
+            )
 
-            # Show reference only for the selected reference filename.
+            # Reference selection by filename
             is_reference = (
                 uploaded_file.name == REFERENCE_FILENAME
             )
 
             if is_reference:
+
                 st.info(
-                    f"Verified STEAD reference case selected: {REFERENCE_ID}"
+                    f"STEAD reference recording: {REFERENCE_ID}"
                 )
 
-            # ---------------- RESULTS ----------------
+            # ====================================================
+            # 10. CALCULATE MAGNITUDE
+            # ====================================================
 
             magnitude = None
             lower_spread = None
@@ -263,12 +411,10 @@ if uploaded_file is not None:
 
             if result is not None:
 
-                p_sample = result["p_sample"]
-
                 features = extract_magnitude_features(
                     trace,
-                    p_sample,
-                    columns
+                    result["p_sample"],
+                    feature_columns
                 )
 
                 magnitude = float(
@@ -281,23 +427,37 @@ if uploaded_file is not None:
                 ])
 
                 lower_spread = float(
-                    np.percentile(tree_predictions, 5)
+                    np.percentile(
+                        tree_predictions,
+                        5
+                    )
                 )
 
                 upper_spread = float(
-                    np.percentile(tree_predictions, 95)
+                    np.percentile(
+                        tree_predictions,
+                        95
+                    )
                 )
 
-            # ---------------- WAVEFORM GRAPHS ----------------
+            # ====================================================
+            # 11. SEISMIC WAVEFORM GRAPHS
+            # ====================================================
 
-            st.subheader("Seismic Waveform Analysis")
+            st.divider()
 
-            time_axis = np.arange(len(trace)) / FS
+            st.subheader(
+                "Seismic Waveform Analysis"
+            )
+
+            time_axis = (
+                np.arange(len(trace)) / FS
+            )
 
             fig, axes = plt.subplots(
-                4, 1,
-                figsize=(12, 12),
-                sharex=False
+                4,
+                1,
+                figsize=(12, 13)
             )
 
             channel_names = ["E", "N", "Z"]
@@ -308,10 +468,11 @@ if uploaded_file is not None:
                     time_axis,
                     trace[:, i],
                     linewidth=0.6,
-                    label=f"{channel_name} component"
+                    label=f"{channel_name} Component"
                 )
 
                 if is_reference:
+
                     axes[i].axvline(
                         REFERENCE_P_TIME,
                         color="green",
@@ -321,6 +482,7 @@ if uploaded_file is not None:
                     )
 
                 if result is not None:
+
                     axes[i].axvline(
                         result["estimated_p_time"],
                         color="red",
@@ -333,9 +495,18 @@ if uploaded_file is not None:
                     f"{channel_name} Component"
                 )
 
-                axes[i].set_ylabel("Amplitude")
-                axes[i].legend(loc="upper right")
-                axes[i].grid(True)
+                axes[i].set_ylabel(
+                    "Amplitude"
+                )
+
+                axes[i].legend(
+                    loc="upper right"
+                )
+
+                axes[i].grid(
+                    True,
+                    alpha=0.3
+                )
 
             # CNN probability graph
 
@@ -347,17 +518,19 @@ if uploaded_file is not None:
                 probability_times,
                 probabilities,
                 color="purple",
-                label="CNN detection probability"
+                linewidth=1,
+                label="CNN Detection Probability"
             )
 
             axes[3].axhline(
                 THRESHOLD,
                 color="black",
                 linestyle="--",
-                label="Detection threshold"
+                label="Detection Threshold"
             )
 
             if is_reference:
+
                 axes[3].axvline(
                     REFERENCE_P_TIME,
                     color="green",
@@ -366,6 +539,7 @@ if uploaded_file is not None:
                 )
 
             if result is not None:
+
                 axes[3].axvline(
                     result["decision_time"],
                     color="red",
@@ -373,27 +547,43 @@ if uploaded_file is not None:
                     label="Detection decision time"
                 )
 
-            axes[3].set_title("CNN P-wave Detection Probability")
-            axes[3].set_xlabel("Time (seconds)")
-            axes[3].set_ylabel("Probability")
-            axes[3].legend(loc="upper right")
-            axes[3].grid(True)
+            axes[3].set_title(
+                "CNN P-wave Detection Probability"
+            )
+
+            axes[3].set_xlabel(
+                "Time (seconds)"
+            )
+
+            axes[3].set_ylabel(
+                "Probability"
+            )
+
+            axes[3].legend(
+                loc="upper right"
+            )
+
+            axes[3].grid(
+                True,
+                alpha=0.3
+            )
 
             fig.tight_layout()
 
-            st.write("### Seismic Waveform Graph")
+            st.write(
+                "### Seismic Waveform Graph"
+            )
 
             st.pyplot(
                 fig,
-                clear_figure=True,
                 use_container_width=True
-             )
+            )
 
-              plt.close(fig)
+            plt.close(fig)
 
-              st.success("Waveform graph rendered.")
-
-            # ---------------- P-WAVE DETECTION ----------------
+            # ====================================================
+            # 12. DETECTION RESULTS
+            # ====================================================
 
             if result is None:
 
@@ -408,29 +598,33 @@ if uploaded_file is not None:
 
             else:
 
-                st.subheader("Earthquake Analysis Results")
+                st.divider()
 
-                c1, c2 = st.columns(2)
+                st.subheader(
+                    "Earthquake Analysis Results"
+                )
 
-                c1.metric(
-                    "P-wave detection probability",
+                col1, col2 = st.columns(2)
+
+                col1.metric(
+                    "P-wave Detection Probability",
                     f"{result['probability']:.4f}"
                 )
 
-                c2.metric(
-                    "Estimated magnitude (ML)",
+                col2.metric(
+                    "Estimated Magnitude (ML)",
                     f"{magnitude:.2f}"
                 )
 
-                c3, c4 = st.columns(2)
+                col3, col4 = st.columns(2)
 
-                c3.metric(
-                    "Detection decision time",
+                col3.metric(
+                    "Detection Decision Time",
                     f"{result['decision_time']:.2f} s"
                 )
 
-                c4.metric(
-                    "Estimated P-wave arrival",
+                col4.metric(
+                    "Estimated P-wave Arrival",
                     f"{result['estimated_p_time']:.2f} s"
                 )
 
@@ -439,7 +633,9 @@ if uploaded_file is not None:
                     f"{lower_spread:.2f} – {upper_spread:.2f}"
                 )
 
-                # ---------------- REFERENCE COMPARISON ----------------
+                # ====================================================
+                # 13. REFERENCE COMPARISON
+                # ====================================================
 
                 if is_reference:
 
@@ -454,75 +650,123 @@ if uploaded_file is not None:
                         "STEAD metadata record."
                     )
 
+                    st.write(
+                        "**Dataset:** STEAD"
+                    )
+
+                    st.write(
+                        f"**Recording ID:** `{REFERENCE_ID}`"
+                    )
+
+                    st.write(
+                        "**Magnitude type:** ML"
+                    )
+
                     arrival_error = abs(
-                        result["estimated_p_time"] - REFERENCE_P_TIME
+                        result["estimated_p_time"] -
+                        REFERENCE_P_TIME
                     )
 
                     magnitude_error = abs(
-                        magnitude - REFERENCE_MAGNITUDE
+                        magnitude -
+                        REFERENCE_MAGNITUDE
                     )
 
-                    st.markdown("#### Reference information")
+                    # Arrival comparison
 
-                    st.write(f"**Dataset:** STEAD")
-                    st.write(f"**Recording ID:** `{REFERENCE_ID}`")
-                    st.write("**Magnitude type:** ML")
+                    st.markdown(
+                        "#### P-wave Arrival Comparison"
+                    )
 
                     col1, col2 = st.columns(2)
 
                     col1.metric(
-                        "Actual P-wave arrival",
+                        "Actual P-wave Arrival",
                         f"{REFERENCE_P_TIME:.2f} s"
                     )
 
                     col2.metric(
-                        "Predicted P-wave arrival",
+                        "Predicted P-wave Arrival",
                         f"{result['estimated_p_time']:.2f} s",
-                        delta=f"{result['estimated_p_time'] - REFERENCE_P_TIME:+.2f} s"
+                        delta=(
+                            f"{result['estimated_p_time'] - REFERENCE_P_TIME:+.2f} s"
+                        )
+                    )
+
+                    # Magnitude comparison
+
+                    st.markdown(
+                        "#### Magnitude Comparison"
                     )
 
                     col3, col4 = st.columns(2)
 
                     col3.metric(
-                        "Actual magnitude (ML)",
+                        "Actual Magnitude (ML)",
                         f"{REFERENCE_MAGNITUDE:.2f}"
                     )
 
                     col4.metric(
-                        "Predicted magnitude (ML)",
+                        "Predicted Magnitude (ML)",
                         f"{magnitude:.2f}",
-                        delta=f"{magnitude - REFERENCE_MAGNITUDE:+.2f}"
+                        delta=(
+                            f"{magnitude - REFERENCE_MAGNITUDE:+.2f}"
+                        )
                     )
 
-                    st.markdown("#### Absolute prediction errors")
+                    # Errors
+
+                    st.markdown(
+                        "#### Absolute Prediction Errors"
+                    )
 
                     err1, err2 = st.columns(2)
 
                     err1.metric(
-                        "P-wave arrival error",
+                        "P-wave Arrival Error",
                         f"{arrival_error:.2f} seconds"
                     )
 
                     err2.metric(
-                        "Magnitude error",
+                        "Magnitude Error",
                         f"{magnitude_error:.2f} ML"
                     )
 
                     # Magnitude comparison graph
 
+                    st.markdown(
+                        "#### Actual vs Predicted Magnitude Graph"
+                    )
+
                     comparison_fig, ax = plt.subplots(
                         figsize=(8, 4)
                     )
 
-                    labels = ["Actual magnitude", "Predicted magnitude"]
-                    values = [REFERENCE_MAGNITUDE, magnitude]
+                    labels = [
+                        "Actual Magnitude",
+                        "Predicted Magnitude"
+                    ]
 
-                    bars = ax.bar(labels, values)
+                    values = [
+                        REFERENCE_MAGNITUDE,
+                        magnitude
+                    ]
 
-                    ax.set_ylabel("Magnitude (ML)")
-                    ax.set_title("Actual vs Predicted Magnitude")
+                    bars = ax.bar(
+                        labels,
+                        values
+                    )
+
+                    ax.set_ylabel(
+                        "Magnitude (ML)"
+                    )
+
+                    ax.set_title(
+                        "Actual vs Predicted Magnitude"
+                    )
 
                     for bar, value in zip(bars, values):
+
                         ax.text(
                             bar.get_x() + bar.get_width() / 2,
                             bar.get_height(),
@@ -531,20 +775,29 @@ if uploaded_file is not None:
                             va="bottom"
                         )
 
-                    ax.grid(axis="y", alpha=0.3)
+                    ax.grid(
+                        axis="y",
+                        alpha=0.3
+                    )
+
                     comparison_fig.tight_layout()
 
-                    st.pyplot(comparison_fig)
+                    st.pyplot(
+                        comparison_fig,
+                        use_container_width=True
+                    )
+
                     plt.close(comparison_fig)
 
                     st.caption(
-                        "Reference values are displayed because the "
-                        "uploaded filename matches the selected reference "
-                        "case. Confirm the recording identity before using "
-                        "these values in a formal evaluation."
+                        "Reference values are displayed for the selected "
+                        "reference filename. Confirm the recording identity "
+                        "before using these values in formal evaluation."
                     )
 
-                # ---------------- LIMITATIONS ----------------
+                # ====================================================
+                # 14. RESEARCH LIMITATIONS
+                # ====================================================
 
                 st.warning(
                     "Research limitations: P-wave arrival uses a fixed "
@@ -555,15 +808,19 @@ if uploaded_file is not None:
                 )
 
         except Exception as error:
-            st.error(f"Analysis failed: {error}")
+
+            st.error(
+                f"Analysis failed: {error}"
+            )
 
 
-# ---------------- FOOTER ----------------
+# ============================================================
+# 15. FOOTER
+# ============================================================
 
 st.divider()
 
 st.caption(
-    "Research project: P-Wave-Based Earthquake Early Warning "
+    "Research Project: P-Wave-Based Earthquake Early Warning "
     "and Magnitude Estimation Using Machine Learning."
 )
-
