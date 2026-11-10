@@ -440,73 +440,65 @@ if uploaded_file is not None:
                     )
                 )
 
+            
             # ====================================================
             # 11. SEISMIC WAVEFORM GRAPHS
             # ====================================================
 
             st.divider()
+            st.subheader("Seismic Waveform Analysis")
 
-            st.subheader(
-                "Seismic Waveform Analysis"
+            time_axis = np.arange(len(trace)) / FS
+
+            # Prepare waveform data
+            waveform_df = pd.DataFrame({
+                "Time (seconds)": time_axis,
+                "East (E)": trace[:, 0],
+                "North (N)": trace[:, 1],
+                "Vertical (Z)": trace[:, 2]
+            })
+
+            st.markdown("### Three-component seismic waveform")
+
+            st.line_chart(
+                waveform_df.set_index("Time (seconds)"),
+                height=280,
+                use_container_width=True
             )
 
-            time_axis = (
-                np.arange(len(trace)) / FS
+            # Display reference and estimated arrival times
+            if is_reference:
+                st.info(
+                    f"Actual P-wave arrival: {REFERENCE_P_TIME:.2f} seconds"
+                )
+
+            if result is not None:
+                st.info(
+                    f"Estimated P-wave arrival: "
+                    f"{result['estimated_p_time']:.2f} seconds"
+                )
+
+            # CNN probability graph
+            probability_times = (
+                np.asarray(starts) + WINDOW_SIZE
+            ) / FS
+
+            probability_df = pd.DataFrame({
+                "Decision time (seconds)": probability_times,
+                "CNN probability": probabilities
+            })
+
+            st.markdown("### CNN P-wave detection probability")
+
+            st.line_chart(
+                probability_df.set_index("Decision time (seconds)"),
+                height=250,
+                use_container_width=True
             )
 
-            fig, axes = plt.subplots(
-                4,
-                1,
-                figsize=(12, 13)
+            st.caption(
+                f"Detection threshold: {THRESHOLD:.2f}"
             )
-
-            channel_names = ["E", "N", "Z"]
-
-            for i, channel_name in enumerate(channel_names):
-
-                axes[i].plot(
-                    time_axis,
-                    trace[:, i],
-                    linewidth=0.6,
-                    label=f"{channel_name} Component"
-                )
-
-                if is_reference:
-
-                    axes[i].axvline(
-                        REFERENCE_P_TIME,
-                        color="green",
-                        linestyle="--",
-                        linewidth=1.5,
-                        label="Actual P-wave arrival"
-                    )
-
-                if result is not None:
-
-                    axes[i].axvline(
-                        result["estimated_p_time"],
-                        color="red",
-                        linestyle=":",
-                        linewidth=1.5,
-                        label="Estimated P-wave arrival"
-                    )
-
-                axes[i].set_title(
-                    f"{channel_name} Component"
-                )
-
-                axes[i].set_ylabel(
-                    "Amplitude"
-                )
-
-                axes[i].legend(
-                    loc="upper right"
-                )
-
-                axes[i].grid(
-                    True,
-                    alpha=0.3
-                )
 
             # CNN probability graph
 
