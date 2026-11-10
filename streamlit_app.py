@@ -24,6 +24,7 @@ REFERENCE_P_TIME = 9.00
 
 st.set_page_config(page_title="Earthquake Early Warning", page_icon="🌍", layout="wide")
 
+
 @st.cache_resource
 def load_models():
     cnn = tf.keras.models.load_model(os.path.join(MODEL_DIR, "pwave_cnn_v2.keras"))
@@ -100,6 +101,28 @@ def load_waveform(uploaded_file):
     return trace
 
 
+def load_ground_truth(metadata_file):
+    if metadata_file is None:
+        return {}
+    metadata = pd.read_csv(io.BytesIO(metadata_file.getvalue()))
+    required = {
+        "filename",
+        "record_id",
+        "actual_magnitude_ml",
+        "actual_p_arrival_sec",
+    }
+    missing = required.difference(metadata.columns)
+    if missing:
+        raise ValueError(
+            "Ground-truth metadata is missing columns: " + ", ".join(sorted(missing))
+        )
+    metadata["filename"] = metadata["filename"].astype(str).str.strip()
+    return {
+        row["filename"]: row
+        for _, row in metadata.iterrows()
+    }
+
+
 def detect_p_wave(trace, cnn, channel_mean, channel_std):
     starts = np.arange(0, len(trace) - WINDOW_SIZE + 1, STRIDE)
     windows = np.stack([trace[s:s + WINDOW_SIZE] for s in starts]).astype(np.float32)
@@ -119,10 +142,10 @@ def detect_p_wave(trace, cnn, channel_mean, channel_std):
     }, probabilities, starts
 
 
-def arrival_rules(is_reference, result):
+def arrival_rules(actual_p_time, result):
     rules = []
-    if is_reference:
-        rules.append((REFERENCE_P_TIME, "Actual P-wave", "#16a34a"))
+    if actual_p_time is not None and pd.notna(actual_p_time):
+        rules.append((float(actual_p_time), "Actual P-wave", "#16a34a"))
     if result is not None:
         rules.append((result["estimated_p_time"], "Estimated P-wave", "#dc2626"))
     return rules
@@ -137,11 +160,11 @@ def add_arrival_rules(chart, rules):
     return chart
 
 
-def show_waveform_charts(trace, result, probabilities, starts, is_reference):
+def show_waveform_charts(trace, result, probabilities, starts, actual_p_time):
     st.subheader("Seismic Waveform Analysis")
-    st.caption("Green dashed line: actual labelled P-wave. Red dashed line: estimated P-wave.")
+    st.caption("Green dashed line: actual labelled P-wave. Red dashed line: model-estimated P-wave.")
     time = np.arange(len(trace)) / FS
-    rules = arrival_rules(is_reference, result)
+    rules = arrival_rules(actual_p_time, result)
 
     for channel, label in enumerate(["East (E)", "North (N)", "Vertical (Z)"]):
         data = pd.DataFrame({"Time": time, "Amplitude": trace[:, channel]})
@@ -169,24 +192,59 @@ def show_waveform_charts(trace, result, probabilities, starts, is_reference):
 st.title("🌍 Earthquake Early Warning System")
 st.subheader("P-wave Detection and Magnitude Estimation")
 st.caption("Machine Learning Research Prototype | 100 Hz | Three-component seismic waveform")
-st.info("Upload a CSV or NPY waveform with three components in East (E), North (N), Vertical (Z) order.")
+st.info(
+    "Upload a waveform CSV/NPY and, for verified STEAD comparisons, also upload "
+    "the companion ground_truth_metadata.csv file."
+)
 
+metadata_file = st.file_uploader(
+    "Upload ground-truth metadata (optional, upload once per session)",
+    type=["csv"],
+    key="ground_truth_metadata",
+)
 uploaded_file = st.file_uploader("Upload seismic waveform", type=["csv", "npy"])
 
 if uploaded_file is not None and st.button("Analyze Earthquake", type="primary"):
     try:
+        ground_truth_by_filename = load_ground_truth(metadata_file)
+        ground_truth = ground_truth_by_filename.get(uploaded_file.name)
+
+        # Preserve the previously verified original reference case.
+        if ground_truth is None and uploaded_file.name == REFERENCE_FILENAME:
+            ground_truth = {
+                "record_id": REFERENCE_ID,
+                "actual_magnitude_ml": REFERENCE_MAGNITUDE,
+                "actual_p_arrival_sec": REFERENCE_P_TIME,
+            }
+
+        actual_p_time = None
+        actual_magnitude = None
+        record_id = None
+        if ground_truth is not None:
+            record_id = str(ground_truth["record_id"])
+            actual_p_time = float(ground_truth["actual_p_arrival_sec"])
+            actual_magnitude = float(ground_truth["actual_magnitude_ml"])
+
         with st.spinner("Loading models and analyzing waveform..."):
             cnn, magnitude_model, channel_mean, channel_std, columns = load_models()
             trace = load_waveform(uploaded_file)
-            result, probabilities, starts = detect_p_wave(trace, cnn, channel_mean, channel_std)
+            result, probabilities, starts = detect_p_wave(
+                trace, cnn, channel_mean, channel_std
+            )
 
         st.success("Waveform loaded successfully.")
-        is_reference = uploaded_file.name == REFERENCE_FILENAME
-        if is_reference:
-            st.info(f"Reference case selected: {REFERENCE_ID}")
-            st.caption("Reference matching is based on filename only. It does not authenticate file contents.")
+        if ground_truth is not None:
+            st.info(f"STEAD reference recording: {record_id}")
+            st.caption("Actual values are taken from the uploaded STEAD ground-truth metadata.")
+        else:
+            st.info(
+                "No matching ground-truth row was found for this filename. "
+                "Only model predictions can be displayed for this recording."
+            )
 
-        show_waveform_charts(trace, result, probabilities, starts, is_reference)
+        show_waveform_charts(
+            trace, result, probabilities, starts, actual_p_time
+        )
 
         if result is None:
             st.warning("No P-wave trigger detected at the selected threshold.")
@@ -198,35 +256,53 @@ if uploaded_file is not None and st.button("Analyze Earthquake", type="primary")
             c2.metric("Estimated P-wave arrival", f"{result['estimated_p_time']:.2f} s")
             st.metric("Detection decision time", f"{result['decision_time']:.2f} s")
 
+            magnitude = None
             try:
-                features = extract_magnitude_features(trace, result["p_sample"], columns)
+                features = extract_magnitude_features(
+                    trace, result["p_sample"], columns
+                )
                 magnitude = float(magnitude_model.predict(features)[0])
-                tree_predictions = np.array([tree.predict(features)[0] for tree in magnitude_model.estimators_])
-                lower_spread, upper_spread = np.percentile(tree_predictions, [5, 95])
+                tree_predictions = np.array([
+                    tree.predict(features)[0]
+                    for tree in magnitude_model.estimators_
+                ])
+                lower_spread, upper_spread = np.percentile(
+                    tree_predictions, [5, 95]
+                )
                 st.metric("Estimated magnitude (ML)", f"{magnitude:.2f}")
-                st.write(f"**Random Forest tree prediction spread:** {lower_spread:.2f} to {upper_spread:.2f}")
+                st.write(
+                    f"**Random Forest tree prediction spread:** "
+                    f"{lower_spread:.2f} to {upper_spread:.2f}"
+                )
             except ValueError as exc:
-                magnitude = None
                 st.warning(f"Magnitude could not be estimated: {exc}")
 
-            if is_reference:
+            if ground_truth is not None:
                 st.divider()
-                st.subheader("STEAD Reference vs Model Prediction")
-                st.write(f"**Recording ID:** `{REFERENCE_ID}`")
+                st.subheader("STEAD Ground Truth vs Model Prediction")
+                st.write(f"**Recording ID:** `{record_id}`")
                 st.write("**Reference dataset:** STEAD | **Magnitude type:** ML")
+
                 a, b = st.columns(2)
-                a.metric("Actual P-wave arrival", f"{REFERENCE_P_TIME:.2f} s")
+                a.metric("Actual P-wave arrival", f"{actual_p_time:.2f} s")
                 b.metric("Estimated P-wave arrival", f"{result['estimated_p_time']:.2f} s")
-                st.metric("Absolute arrival-time error", f"{abs(result['estimated_p_time'] - REFERENCE_P_TIME):.2f} s")
+                st.metric(
+                    "Absolute arrival-time error",
+                    f"{abs(result['estimated_p_time'] - actual_p_time):.2f} s",
+                )
 
                 if magnitude is not None:
                     a, b = st.columns(2)
-                    a.metric("Actual magnitude (ML)", f"{REFERENCE_MAGNITUDE:.2f}")
-                    b.metric("Estimated magnitude (ML)", f"{magnitude:.2f}")
-                    st.metric("Absolute magnitude error", f"{abs(magnitude - REFERENCE_MAGNITUDE):.2f} ML")
+                    a.metric("Actual magnitude (ML)", f"{actual_magnitude:.2f}")
+                    b.metric("Predicted magnitude (ML)", f"{magnitude:.2f}")
+                    st.metric(
+                        "Absolute magnitude error",
+                        f"{abs(magnitude - actual_magnitude):.2f} ML",
+                    )
+
                     comparison = pd.DataFrame({
                         "Type": ["Actual magnitude", "Predicted magnitude"],
-                        "Magnitude": [REFERENCE_MAGNITUDE, magnitude],
+                        "Magnitude": [actual_magnitude, magnitude],
                     })
                     bar = alt.Chart(comparison).mark_bar().encode(
                         x=alt.X("Type:N", title=None),
@@ -245,4 +321,6 @@ if uploaded_file is not None and st.button("Analyze Earthquake", type="primary")
         st.error(f"Analysis failed: {error}")
 
 st.divider()
-st.caption("P-Wave-Based Earthquake Early Warning and Magnitude Estimation Using Machine Learning")
+st.caption(
+    "P-Wave-Based Earthquake Early Warning and Magnitude Estimation Using Machine Learning"
+)
