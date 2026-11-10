@@ -1,0 +1,7 @@
+gradio==5.49.1
+tensorflow-cpu==2.16.1
+numpy<2
+pandas
+matplotlib
+scikit-learn
+joblib
