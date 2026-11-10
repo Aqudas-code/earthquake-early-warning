@@ -389,9 +389,9 @@ if uploaded_file is not None:
                 use_container_width=True
              )
 
-             plt.close(fig)
+              plt.close(fig)
 
-             st.success("Waveform graph rendered.")
+              st.success("Waveform graph rendered.")
 
             # ---------------- P-WAVE DETECTION ----------------
 
